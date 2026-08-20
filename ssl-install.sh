@@ -9,60 +9,70 @@ echo -e "${GREEN}=== SSL Certificate Installer (Let's Encrypt) ===${NC}"
 
 # Проверка root прав
 if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}Пожалуйста, запустите скрипт от root${NC}"
+    echo -e "${RED}Пожалуйста, запустите скрипт от root (sudo)${NC}"
     exit 1
 fi
 
 # 1. Запрос данных
 read -p "Введите домен (например: example.ru): " DOMAIN
 read -p "Введите email для уведомлений: " EMAIL
-read -p "Использовать wildcard сертификат (*.example.ru)? [y/N]: " WILDCARD
-WILDCARD=${WILDCARD:-N}
 
-if [[ "$WILDCARD" =~ ^[Yy]$ ]]; then
-    CERT_DOMAIN="*.$DOMAIN"
-    echo -e "${YELLOW}Wildcard режим: $CERT_DOMAIN${NC}"
-    echo -e "${YELLOW}ВНИМАНИЕ: Для wildcard нужен DNS challenge!${NC}"
-    read -p "Какой DNS провайдер вы используете? (cloudflare/digitalocean/route53/other): " DNS_PROVIDER
+# Проверяем, что занимает порт 80
+PORT_80_PID=$(sudo lsof -t -i:80 2>/dev/null | head -n 1)
+if [ -n "$PORT_80_PID" ]; then
+    echo -e "${YELLOW}Порт 80 занят процессом (PID: $PORT_80_PID).${NC}"
+    echo -e "${YELLOW}Скрипт временно остановит его для получения сертификата, а затем настроит Nginx как прокси.${NC}"
+    read -p "Введите внутренний порт для вашего приложения (hello-server), например 8080: " INTERNAL_PORT
+    INTERNAL_PORT=${INTERNAL_PORT:-8080}
 else
-    CERT_DOMAIN="$DOMAIN"
-    echo -e "${YELLOW}Обычный сертификат для: $CERT_DOMAIN${NC}"
+    INTERNAL_PORT=8080
 fi
-
-read -p "Порт вашего веб-сервера (где работает hello-server): " WEB_PORT
-WEB_PORT=${WEB_PORT:-80}
 
 # 2. Установка зависимостей
 echo -e "${GREEN}Установка необходимых пакетов...${NC}"
+apt-get update -qq
+apt-get install -y certbot python3-certbot-nginx nginx lsof
 
-if command -v apt-get &> /dev/null; then
-    apt-get update
-    apt-get install -y certbot python3-certbot-nginx nginx
-    if [[ "$WILDCARD" =~ ^[Yy]$ ]]; then
-        apt-get install -y python3-certbot-dns-cloudflare python3-certbot-dns-digitalocean python3-certbot-dns-route53
+# 3. Временная остановка служб на 80 порту
+if [ -n "$PORT_80_PID" ]; then
+    echo -e "${YELLOW}Временная остановка службы на порту 80...${NC}"
+    systemctl stop hello-server 2>/dev/null || true
+    sleep 2
+    # Если все еще занят, убиваем принудительно
+    if sudo lsof -t -i:80 >/dev/null 2>&1; then
+        sudo kill -9 $(sudo lsof -t -i:80) 2>/dev/null || true
     fi
-elif command -v yum &> /dev/null; then
-    yum install -y certbot python3-certbot-nginx nginx
-    if [[ "$WILDCARD" =~ ^[Yy]$ ]]; then
-        yum install -y python3-certbot-dns-cloudflare
-    fi
-elif command -v apk &> /dev/null; then
-    apk add --no-cache certbot certbot-nginx nginx
-    if [[ "$WILDCARD" =~ ^[Yy]$ ]]; then
-        apk add --no-cache certbot-dns-cloudflare
-    fi
-else
-    echo -e "${RED}Неподдерживаемая система${NC}"
+fi
+
+# 4. Получение сертификата (Standalone режим, так как порт 80 теперь свободен)
+echo -e "${GREEN}Получение SSL сертификата...${NC}"
+certbot certonly \
+    --standalone \
+    --preferred-challenges http \
+    -d "$DOMAIN" -d "www.$DOMAIN" \
+    --email "$EMAIL" \
+    --agree-tos \
+    --non-interactive \
+    --http-01-port 80
+
+if [ $? -ne 0 ]; then
+    echo -e "${RED}Не удалось получить сертификат!${NC}"
+    echo -e "${YELLOW}Проверьте, что домен $DOMAIN и www.$DOMAIN указывают на IP этого сервера.${NC}"
+    echo -e "${YELLOW}Логи: /var/log/letsencrypt/letsencrypt.log${NC}"
     exit 1
 fi
 
-# 3. Настройка Nginx как reverse proxy
+# 5. Настройка Nginx
 echo -e "${GREEN}Настройка Nginx...${NC}"
 
 NGINX_CONF="/etc/nginx/sites-available/$DOMAIN"
 NGINX_LINK="/etc/nginx/sites-enabled/$DOMAIN"
 
+# Удаляем старую конфигурацию если есть
+rm -f "$NGINX_LINK"
+
 cat << EOF | tee "$NGINX_CONF" > /dev/null
+# HTTP -> HTTPS redirect
 server {
     listen 80;
     listen [::]:80;
@@ -73,21 +83,23 @@ server {
     }
 
     location / {
-        return 301 https://\$server_name\$request_uri;
+        return 301 https://\$host\$request_uri;
     }
 }
 
+# HTTPS server
 server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
     server_name $DOMAIN www.$DOMAIN;
 
-    ssl_certificate /etc/letsencrypt/live/$CERT_DOMAIN/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$CERT_DOMAIN/privkey.pem;
+    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
 
     ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-    ssl_prefer_server_ciphers on;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
 
     # Security headers
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
@@ -95,7 +107,7 @@ server {
     add_header X-Content-Type-Options "nosniff" always;
 
     location / {
-        proxy_pass http://127.0.0.1:$WEB_PORT;
+        proxy_pass http://127.0.0.1:$INTERNAL_PORT;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
@@ -112,102 +124,46 @@ EOF
 mkdir -p /var/www/certbot
 
 # Включаем сайт
-if [ ! -L "$NGINX_LINK" ]; then
-    ln -s "$NGINX_CONF" "$NGINX_LINK"
-fi
+ln -s "$NGINX_CONF" "$NGINX_LINK"
+
+# Удаляем дефолтный сайт nginx, чтобы не мешал
+rm -f /etc/nginx/sites-enabled/default
 
 # Тестируем конфигурацию nginx
 nginx -t
-
-# 4. Получение сертификата
-echo -e "${GREEN}Получение SSL сертификата...${NC}"
-
-if [[ "$WILDCARD" =~ ^[Yy]$ ]]; then
-    # Wildcard сертификат через DNS challenge
-    case "$DNS_PROVIDER" in
-        cloudflare)
-            read -p "Введите Cloudflare API Token: " -s CF_TOKEN
-            echo
-            export CF_DNS_API_TOKEN="$CF_TOKEN"
-            
-            certbot certonly \
-                --dns-cloudflare \
-                --dns-cloudflare-credentials <(echo "dns_cloudflare_api_token = $CF_TOKEN") \
-                -d "$CERT_DOMAIN" -d "$DOMAIN" \
-                --email "$EMAIL" \
-                --agree-tos \
-                --non-interactive
-            ;;
-        digitalocean)
-            read -p "Введите DigitalOcean API Token: " -s DO_TOKEN
-            echo
-            export DO_TOKEN
-            
-            certbot certonly \
-                --dns-digitalocean \
-                --dns-digitalocean-credentials <(echo "dns_digitalocean_token = $DO_TOKEN") \
-                -d "$CERT_DOMAIN" -d "$DOMAIN" \
-                --email "$EMAIL" \
-                --agree-tos \
-                --non-interactive
-            ;;
-        *)
-            echo -e "${YELLOW}Для других DNS провайдеров настройте credentials файл вручную${NC}"
-            echo "certbot certonly --manual --preferred-challenges dns -d $CERT_DOMAIN -d $DOMAIN --email $EMAIL --agree-tos"
-            exit 1
-            ;;
-    esac
-else
-    # Обычный сертификат через HTTP challenge
-    systemctl stop nginx 2>/dev/null || true
-    
-    certbot certonly \
-        --standalone \
-        -d "$CERT_DOMAIN" -d "www.$DOMAIN" \
-        --email "$EMAIL" \
-        --agree-tos \
-        --non-interactive \
-        --http-01-port 80
-    
-    systemctl start nginx
-fi
-
 if [ $? -ne 0 ]; then
-    echo -e "${RED}Не удалось получить сертификат!${NC}"
+    echo -e "${RED}Ошибка в конфигурации Nginx!${NC}"
     exit 1
 fi
 
-# 5. Настройка автопродления
-echo -e "${GREEN}Настройка автопродления...${NC}"
-
-# Проверяем и настраиваем cron для certbot
-if ! crontab -l | grep -q "certbot renew"; then
-    (crontab -l 2>/dev/null; echo "0 0 1 * * certbot renew --quiet --post-hook 'systemctl reload nginx'") | crontab -
-    echo -e "${GREEN}Добавлено задание в cron для ежемесячной проверки${NC}"
+# 6. Обновление hello-server на новый внутренний порт
+if [ -f "/etc/systemd/system/hello-server.service" ]; then
+    echo -e "${GREEN}Обновление hello-server на внутренний порт $INTERNAL_PORT...${NC}"
+    sed -i -E "s/(ExecStart=.*server.py )[0-9]+/\1$INTERNAL_PORT/" /etc/systemd/system/hello-server.service
+    systemctl daemon-reload
+    systemctl restart hello-server
 fi
 
-# Тестируем продление
-echo -e "${YELLOW}Тестирование автопродления...${NC}"
-certbot renew --dry-run
-
-# 6. Перезапуск nginx
-systemctl restart nginx
+# 7. Запуск Nginx
+echo -e "${GREEN}Запуск Nginx...${NC}"
+systemctl stop nginx 2>/dev/null || true
+systemctl start nginx
 systemctl enable nginx
 
-echo -e "${GREEN}=== Установка завершена! ===${NC}"
-echo -e "SSL сертификат установлен для: ${YELLOW}$CERT_DOMAIN${NC}"
-echo -e "Сайт доступен: ${GREEN}https://$DOMAIN${NC}"
-echo -e "Автопродление настроено (проверка 1-го числа каждого месяца)"
-echo -e "${YELLOW}Срок действия сертификата: 90 дней${NC}"
-echo ""
-echo "Полезные команды:"
-echo "  certbot certificates          - показать установленные сертификаты"
-echo "  certbot renew                 - продлить сертификаты"
-echo "  certbot delete --cert-name $DOMAIN - удалить сертификат"
-echo "  systemctl status nginx        - статус nginx"
-echo "  tail -f /var/log/nginx/error.log - логи nginx"
+# 8. Настройка автопродления
+echo -e "${GREEN}Настройка автопродления...${NC}"
+systemctl enable --now certbot.timer
 
-# Проверка SSL
-echo ""
-echo -e "${GREEN}Проверка SSL конфигурации:${NC}"
-echo "Откройте: https://www.ssllabs.com/ssltest/analyze.html?d=$DOMAIN"
+# Добавляем хук для перезагрузки nginx после успешного продления
+mkdir -p /etc/letsencrypt/renewal-hooks/deploy/
+cat << 'EOF' | tee /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh > /dev/null
+#!/bin/bash
+systemctl reload nginx
+EOF
+chmod +x /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+
+echo -e "${GREEN}=== Установка завершена! ===${NC}"
+echo -e "SSL сертификат установлен для: ${YELLOW}$DOMAIN${NC}"
+echo -e "Сайт доступен: ${GREEN}https://$DOMAIN${NC}"
+echo -e "Ваше приложение теперь работает на внутреннем порту: ${YELLOW}$INTERNAL_PORT${NC}"
+echo -e "Nginx проксирует запросы с 80/443 на порт $INTERNAL_PORT."
