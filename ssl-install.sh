@@ -44,7 +44,7 @@ if [ -n "$PORT_80_PID" ]; then
     fi
 fi
 
-# 4. Получение сертификата (Standalone режим, так как порт 80 теперь свободен)
+# 4. Получение сертификата (Standalone режим)
 echo -e "${GREEN}Получение SSL сертификата...${NC}"
 certbot certonly \
     --standalone \
@@ -53,7 +53,8 @@ certbot certonly \
     --email "$EMAIL" \
     --agree-tos \
     --non-interactive \
-    --http-01-port 80
+    --http-01-port 80 \
+    --force-renewal # Принудительное обновление, чтобы избежать ошибок "not yet due"
 
 if [ $? -ne 0 ]; then
     echo -e "${RED}Не удалось получить сертификат!${NC}"
@@ -89,9 +90,8 @@ server {
 
 # HTTPS server
 server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
-    http2 on;
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
     server_name $DOMAIN www.$DOMAIN;
 
     ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
