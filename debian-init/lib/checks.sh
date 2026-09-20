@@ -20,14 +20,21 @@ detect_os() {
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # Текущий порт SSH из действующей конфигурации (а не из закомментированной строки).
+#
+# Все конвейеры здесь принудительно гасятся через "|| true". Причина: в скрипте
+# включены "set -e" и "set -o pipefail", а "sshd -T" может вернуть ненулевой код
+# (нет host-ключей на свежей системе, socket-активация в Debian 13, Match-блоки),
+# и тогда падала бы вся подстановка $(current_ssh_port), а ERR-трап печатал бы
+# ложную ошибку. Отсутствие порта здесь — не ошибка, а штатный случай: вернём 22.
 current_ssh_port() {
     local p=""
     if have sshd; then
-        p=$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')
+        p=$( { sshd -T 2>/dev/null || true; } | awk '/^port /{print $2; exit}' || true )
     fi
     # В Debian 13 SSH по умолчанию socket-activated: порт задаёт ssh.socket.
     if [[ -z "$p" ]] && systemctl list-unit-files ssh.socket >/dev/null 2>&1; then
-        p=$(systemctl show ssh.socket -p Listen --value 2>/dev/null | grep -oE '[0-9]+ ' | head -1 | tr -d ' ')
+        p=$( { systemctl show ssh.socket -p Listen --value 2>/dev/null || true; } \
+             | grep -oE '[0-9]+ ' | head -1 | tr -d ' ' || true )
     fi
     echo "${p:-22}"
 }
