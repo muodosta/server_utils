@@ -16,8 +16,19 @@ _f2b_apply_fail2ban() {
     # лежат только в журнале, файла /var/log/auth.log может не быть вовсе.
     apt_install fail2ban python3-systemd
 
-    local banaction="nftables-multiport"
-    [[ "${CFG_FW_BACKEND:-nftables}" == ufw ]] && banaction="ufw"
+    # Действие бана должно совпадать с выбранным файрволом.
+    # ufw не понимает параметр type — у него один способ блокировки;
+    # у nftables/iptables он есть, и для рецидивистов закрываем все порты.
+    local banaction banaction_all
+    if [[ "${CFG_FW_BACKEND:-nftables}" == ufw ]]; then
+        banaction="ufw"
+        banaction_all="ufw"
+    else
+        # nftables.conf с параметром type — актуальный синтаксис fail2ban 1.x;
+        # старые имена nftables-multiport/-allports объявлены устаревшими.
+        banaction="nftables[type=multiport]"
+        banaction_all="nftables[type=allports]"
+    fi
 
     write_file /etc/fail2ban/jail.local <<EOF
 # Сгенерировано debian-init
@@ -28,7 +39,7 @@ findtime   = 10m
 maxretry   = ${CFG_F2B_MAXRETRY}
 ignoreip   = 127.0.0.1/8 ::1 ${CFG_F2B_IGNORE}
 banaction  = ${banaction}
-banaction_allports = ${banaction}[type=allports]
+banaction_allports = ${banaction_all}
 
 # Рецидивистов баним надолго
 [recidive]
@@ -46,6 +57,22 @@ EOF
     svc_enable fail2ban
     run systemctl restart fail2ban
     log_ok "fail2ban настроен (banaction=${banaction})"
+
+    # Сразу проверяем, что демон не упал на разборе конфига: молчаливо
+    # неработающий fail2ban хуже отсутствующего — вы думаете, что защищены.
+    if ! (( DRY_RUN )); then
+        local i
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+            fail2ban-client ping >/dev/null 2>&1 && break
+            sleep 2
+        done
+        if ! fail2ban-client ping >/dev/null 2>&1; then
+            log_err "fail2ban не запустился. Диагностика:"
+            log_err "  journalctl -u fail2ban -n 30 --no-pager"
+            log_err "  fail2ban-client -d   # проверка конфига"
+            return 1
+        fi
+    fi
 }
 
 _f2b_apply_crowdsec() {
@@ -77,6 +104,7 @@ mod_f2b_verify() {
     (( DRY_RUN )) && return 0
     if [[ "$CFG_F2B_ENGINE" == fail2ban ]]; then
         fail2ban-client status 2>/dev/null | sed 's/^/    /' || log_warn "fail2ban не отвечает"
+        fail2ban-client status sshd 2>/dev/null | sed 's/^/    /' || true
     else
         cscli metrics 2>/dev/null | head -12 | sed 's/^/    /' || true
     fi
